@@ -25,24 +25,31 @@ STOCK_MAP_ID = "feacdc40-6d77-11ec-9682-7d3cb7a0cb96"   # "T-Pot Attack Map"
 
 # Honeypots of the thesis edition; values of the Logstash "type" field.
 HONEYPOTS = ["Cowrie", "Ddospot", "Dionaea", "Mailoney", "RDPHoneypot", "Sentrypeer", "Tanner"]
-HP_QUERY = "type : (" + " or ".join(HONEYPOTS) + ")"
-SURICATA_QUERY = "type : Suricata and event_type : alert"
-P0F_QUERY = "type : P0f"
+# Exact match on the keyword subfield: the stored values are exactly these strings
+# (verified against Elasticsearch: Cowrie, Ddospot, Dionaea, Mailoney, RDPHoneypot,
+# Sentrypeer, Tanner), so no analyzer is involved.
+HP_QUERY = "type.keyword : (" + " or ".join('"%s"' % h for h in HONEYPOTS) + ")"
+# Panels on optional fields only look at honeypot documents that carry the field.
+PORT_QUERY = HP_QUERY + " and dest_port : *"
+USER_QUERY = HP_QUERY + " and username.keyword : *"
+PASS_QUERY = HP_QUERY + " and password.keyword : *"
 
-# Attack counts per protocol: (label, KQL). Ports are the thesis service ports; Cowrie
-# also logs the in-container ports 2222/2223 for SSH/Telnet.
+# Attack counts per protocol: (label, KQL). Verified against the live data: Cowrie sets
+# "protocol" (ssh / telnet) on every event, but dest_port only on session.connect events,
+# so Cowrie is counted by protocol. All other honeypots carry dest_port (the port inside
+# the container, e.g. Dionaea SMB is 445 even where the host publishes another port).
 PROTOCOLS = [
-    ("SSH (Cowrie)", "type : Cowrie and dest_port : (22 or 2222)"),
-    ("Telnet (Cowrie)", "type : Cowrie and dest_port : (23 or 2223)"),
-    ("DNS (Ddospot)", "type : Ddospot and dest_port : 53"),
-    ("NTP (Ddospot)", "type : Ddospot and dest_port : 123"),
-    ("FTP (Dionaea)", "type : Dionaea and dest_port : 21"),
-    ("SMB (Dionaea)", "type : Dionaea and dest_port : 445"),
-    ("MySQL (Dionaea)", "type : Dionaea and dest_port : 3306"),
-    ("SMTP (Mailoney)", "type : Mailoney"),
-    ("RDP (RDPHoneypot)", "type : RDPHoneypot"),
-    ("SIP (Sentrypeer)", "type : Sentrypeer"),
-    ("HTTP (Snare/Tanner)", "type : Tanner"),
+    ("SSH (Cowrie)", 'type.keyword : "Cowrie" and protocol.keyword : "ssh"'),
+    ("Telnet (Cowrie)", 'type.keyword : "Cowrie" and protocol.keyword : "telnet"'),
+    ("DNS (Ddospot)", 'type.keyword : "Ddospot" and dest_port : 53'),
+    ("NTP (Ddospot)", 'type.keyword : "Ddospot" and dest_port : 123'),
+    ("FTP (Dionaea)", 'type.keyword : "Dionaea" and dest_port : 21'),
+    ("SMB (Dionaea)", 'type.keyword : "Dionaea" and dest_port : 445'),
+    ("MySQL (Dionaea)", 'type.keyword : "Dionaea" and dest_port : 3306'),
+    ("SMTP (Mailoney)", 'type.keyword : "Mailoney"'),
+    ("RDP (RDPHoneypot)", 'type.keyword : "RDPHoneypot"'),
+    ("SIP (Sentrypeer)", 'type.keyword : "Sentrypeer"'),
+    ("HTTP (Snare/Tanner)", 'type.keyword : "Tanner"'),
 ]
 
 
@@ -152,6 +159,41 @@ def attacks_over_time(name, title, query):
     return lens(title, "lnsXY", vis, lid, cols, [sid, did, mid], query)
 
 
+# ------------------------------------------------------------ stock T-Pot objects
+# The repo copy of the stock T-Pot export; its objects are the ones tpotinit imports into
+# Kibana. The Suricata / p0f panels reuse the stock Lens definitions (fields and queries
+# untouched) instead of re-implementing them.
+STOCK_EXPORT = os.path.join(HERE, "..", "..", "docker", "tpotinit", "dist", "etc", "objects",
+                            "kibana_export.ndjson")
+STOCK_P0F_OS = "7a2a7c9f-7cf1-4b0f-86ca-f50768b98a73"        # "P0f OS Distribution" (pie, os.keyword)
+STOCK_SURICATA_CATEGORY = "59847638-da13-4308-bd01-22a176c289af"  # "Suricata Alert Category Histogram"
+
+
+def stock_lens(object_id, title):
+    """Stock T-Pot Lens object as a by-value panel that ignores the dashboard filter.
+
+    The stock layers have ignoreGlobalFilters=false and a query such as "type : Suricata",
+    so embedded by reference they would be ANDed with the thesis honeypot filter of this
+    dashboard and always come back empty. Suricata and p0f are NSM data, not thesis
+    honeypots. Setting the layer option "ignore global filters" (the supported Lens setting)
+    on a by-value copy leaves fields, query and chart exactly as T-Pot defines them; the
+    time range of the dashboard still applies. This is also how the stock ">T-Pot"
+    dashboard embeds its own p0f panel (by value).
+    """
+    with open(STOCK_EXPORT, encoding="utf-8") as fh:
+        objs = {o.get("id"): o for o in (json.loads(l) for l in fh if l.strip())}
+    obj = objs[object_id]
+    assert obj["type"] == "lens", object_id
+    attrs = json.loads(json.dumps(obj["attributes"]))       # deep copy
+    for layer in attrs["state"]["datasourceStates"]["formBased"]["layers"].values():
+        layer["ignoreGlobalFilters"] = True
+    attrs.update({"title": title, "type": "lens", "savedObjectId": object_id,
+                  "references": obj["references"]})
+    # tag references belong to the saved object, not to an embedded panel
+    attrs["references"] = [r for r in attrs["references"] if r["type"] == "index-pattern"]
+    return attrs
+
+
 # ------------------------------------------------------------------- dashboard
 def build():
     panels = []   # (gridData x, y, w, h, kind, payload)
@@ -188,31 +230,28 @@ def build():
         "Source Countries (Top 10)")
     add(16, 43, 16, 14, bar_horizontal(
         "dport", "Destination Ports (Top 10)",
-        lambda m: terms_col("dest_port", "Destination port", m, size=10, data_type="number"), HP_QUERY),
+        lambda m: terms_col("dest_port", "Destination port", m, size=10, data_type="number"), PORT_QUERY),
         "Destination Ports (Top 10)")
     add(32, 43, 16, 14, pie(
         "proto", "Attack Counts per Protocol",
         lambda m: filters_col("Protocol", PROTOCOLS), HP_QUERY),
         "Attack Counts per Protocol")
 
-    # Row 5: network security monitoring (not limited to the honeypot filter)
-    add(0, 57, 24, 14, pie(
-        "suricata", "Suricata Alert Categories",
-        lambda m: terms_col("alert.category.keyword", "Category", m, size=10),
-        SURICATA_QUERY, ignore_global=True), "Suricata Alert Categories")
-    add(24, 57, 24, 14, pie(
-        "p0f", "p0f OS Distribution",
-        lambda m: terms_col("os.keyword", "OS", m, size=10, exclude=['"???"']),
-        P0F_QUERY, ignore_global=True), "p0f OS Distribution")
+    # Row 5: network security monitoring. Stock T-Pot visualizations, not limited to the
+    # thesis honeypot filter (see stock_lens).
+    add(0, 57, 24, 14, stock_lens(STOCK_SURICATA_CATEGORY, "Suricata Alert Categories"),
+        "Suricata Alert Categories")
+    add(24, 57, 24, 14, stock_lens(STOCK_P0F_OS, "p0f OS Distribution"),
+        "p0f OS Distribution")
 
     # Row 6: credentials where honeypots record them (Cowrie, Dionaea, ...)
     add(0, 71, 24, 14, bar_horizontal(
         "user", "Top Usernames",
-        lambda m: terms_col("username.keyword", "Username", m, size=10), HP_QUERY),
+        lambda m: terms_col("username.keyword", "Username", m, size=10), USER_QUERY),
         "Top Usernames")
     add(24, 71, 24, 14, bar_horizontal(
         "pass", "Top Passwords",
-        lambda m: terms_col("password.keyword", "Password", m, size=10), HP_QUERY),
+        lambda m: terms_col("password.keyword", "Password", m, size=10), PASS_QUERY),
         "Top Passwords")
 
     # Geographic panel: the stock T-Pot map object (attack source + destination heatmaps
@@ -246,7 +285,7 @@ def build():
             "optionsJSON": json.dumps({"useMargins": True, "syncColors": True, "syncCursor": True,
                                        "syncTooltips": False, "hidePanelTitles": False}),
             # Dashboard-wide filter: thesis honeypots only. It also drives the map. The
-            # Suricata and p0f panels set ignoreGlobalFilters because they are not honeypots.
+            # The stock Suricata and p0f panels ignore it (ignoreGlobalFilters) because they are not honeypots.
             "kibanaSavedObjectMeta": {"searchSourceJSON": json.dumps(
                 {"query": {"query": HP_QUERY, "language": "kuery"}, "filter": []})},
             "panelsJSON": json.dumps(panels),

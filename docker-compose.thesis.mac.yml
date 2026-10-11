@@ -1,0 +1,40 @@
+# T-Pot THESIS RESEARCH EDITION - Docker Desktop (macOS / Windows) override
+#
+# Use together with the main thesis file, which stays the Linux deployment:
+#   docker compose -f docker-compose.thesis.yml -f docker-compose.thesis.mac.yml up -d
+#
+# Requires TPOT_OSTYPE=mac (or win) in .env. It mirrors what T-Pot's own
+# compose/mac_win.yml changes for tpotinit: Docker Desktop has no real host
+# network, so tpotinit runs on a bridge network without NET_ADMIN (the host
+# firewall, blackhole and NIC tuning steps are skipped on mac/win anyway).
+#
+# Limits on Docker Desktop (as for T-Pot's mac_win edition): fatt, p0f and
+# suricata keep network_mode "host", which here is the Docker VM, not the Mac
+# or its LAN. They start but do not see the honeypot traffic of the Mac's
+# interfaces, so their data is not meaningful for the thesis on this setup.
+
+networks:
+  tpotinit_local:
+
+services:
+  tpotinit:
+    network_mode: !reset null
+    cap_add: !reset null
+    networks:
+      - tpotinit_local
+
+  # macOS Remote Login (sshd) already owns host port 22, so Cowrie is published on
+  # 2222/2223 here. Inside the container it still listens on 22/23, so the logged
+  # destination ports and the Kibana/Attack Map protocol mapping are unchanged.
+  cowrie:
+    ports: !override
+      - "2222:22"
+      - "2223:23"
+
+  # Same for SMB: macOS File Sharing owns host port 445. Dionaea listens on 445
+  # inside the container, so the logged destination port stays 445.
+  dionaea:
+    ports: !override
+      - "21:21"
+      - "4445:445"
+      - "3306:3306"
